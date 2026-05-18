@@ -131,6 +131,9 @@ class MercatorumAPI:
     def get_course_pdfs(self, course_code: str) -> list[Pdf]:
         """Walk the course's lp-folders → lessons → fetch each lesson's dispensa.
 
+        If `lp-folders` is empty (some courses don't use the folder structure),
+        falls back to brute-force enumeration of lp_ids in a bounded range.
+
         Returns a deduplicated list of Pdf objects with module ordering metadata.
         """
         # 1) Top-level folders.
@@ -149,49 +152,64 @@ class MercatorumAPI:
                 log.warning("folder %s fetch failed: %s", folder_id, e)
                 return []
 
-        with ThreadPoolExecutor(max_workers=8) as ex:
-            folder_lessons = list(ex.map(fetch_folder, folders))
-
-        # 3) Flatten to (lp_id, display_order, lesson_name) tuples.
         lessons: list[tuple[int, int | None, str]] = []
-        for lessons_in_folder in folder_lessons:
-            for lesson in lessons_in_folder:
-                lp_id = lesson.get("lp_id") or lesson.get("id")
-                if lp_id is None:
-                    continue
-                lessons.append((
-                    int(lp_id),
-                    lesson.get("display_order"),
-                    lesson.get("name") or lesson.get("title") or f"lp_{lp_id}",
-                ))
+        if folders:
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                folder_lessons = list(ex.map(fetch_folder, folders))
+            for lessons_in_folder in folder_lessons:
+                for lesson in lessons_in_folder:
+                    lp_id = lesson.get("lp_id") or lesson.get("id")
+                    if lp_id is None:
+                        continue
+                    lessons.append((
+                        int(lp_id),
+                        lesson.get("display_order"),
+                        lesson.get("name") or lesson.get("title") or f"lp_{lp_id}",
+                    ))
 
-        # 4) Fetch each lesson's dispensa in parallel.
-        #    Endpoint quirk: /video-lesson/{X}/paragraphs/{Y} ignores X; only Y
-        #    selects the lesson. Passing the same lp_id twice is what works.
-        def fetch_lesson(item: tuple[int, int | None, str]) -> tuple[tuple, list[str]]:
+        # Fallback for courses where lp-folders is empty (e.g. Elettrotecnica):
+        # brute-force enumerate lp_ids. The paragraphs endpoint /video-lesson/{X}/
+        # paragraphs/{Y} ignores X; only Y selects the lesson.
+        if not lessons:
+            log.info("lp-folders empty for %s — brute-forcing lp_ids 1..%d",
+                     course_code, BRUTE_FORCE_MAX_LP_ID)
+            lessons = [(i, i, f"lp_{i}") for i in range(1, BRUTE_FORCE_MAX_LP_ID + 1)]
+
+        # 3) Fetch each lesson's dispensa in parallel.
+        def fetch_lesson(item: tuple[int, int | None, str]):
             lp_id, _, _ = item
             try:
                 data = self._get(
                     f"student/course/{course_code}/video-lesson/{lp_id}/paragraphs/{lp_id}"
                 )
-                return item, _extract_book_urls(data)
-            except Exception as e:
-                log.warning("lp_id=%s fetch failed: %s", lp_id, e)
-                return item, []
+                return item, _extract_book_urls(data), data
+            except Exception:
+                return item, [], None
 
         with ThreadPoolExecutor(max_workers=8) as ex:
             results = list(ex.map(fetch_lesson, lessons))
 
-        # 5) Dedup by URL while preserving discovery order.
+        # 4) Dedup by URL, recover real titles for brute-forced lp_ids.
         seen: set[str] = set()
         pdfs: list[Pdf] = []
-        for (lp_id, display_order, lesson_name), urls in results:
+        for (lp_id, display_order, lesson_name), urls, data in results:
+            if not urls:
+                continue
+            if lesson_name.startswith("lp_") and data:
+                real = _find_lesson_title(data)
+                if real:
+                    lesson_name = real
             for url in urls:
                 if url in seen:
                     continue
                 seen.add(url)
                 pdfs.append(Pdf(url=url, module_number=display_order, module_title=lesson_name))
         return pdfs
+
+
+# Upper bound for the brute-force fallback. Extra probes return empty quickly,
+# so 200 is a safe ceiling for any reasonable course.
+BRUTE_FORCE_MAX_LP_ID = 200
 
 
 # ---------------------------------------------------------------- helpers
@@ -220,3 +238,22 @@ def _extract_book_urls(node: Any) -> list[str]:
         for v in node:
             out.extend(_extract_book_urls(v))
     return out
+
+
+def _find_lesson_title(node: Any) -> str | None:
+    """Find the lesson title inside a paragraphs response (`contentType: lesson`)."""
+    if isinstance(node, dict):
+        if node.get("contentType") == "lesson":
+            title = node.get("title") or node.get("name")
+            if isinstance(title, str) and title.strip():
+                return title.strip()
+        for v in node.values():
+            r = _find_lesson_title(v)
+            if r:
+                return r
+    elif isinstance(node, list):
+        for v in node:
+            r = _find_lesson_title(v)
+            if r:
+                return r
+    return None
