@@ -1,15 +1,18 @@
-"""PDF downloader: streaming, idempotent (skips if same size on disk)."""
+"""PDF dispense downloader: streaming, idempotent."""
 
 from __future__ import annotations
 
 import re
 import unicodedata
+import logging
 from pathlib import Path
 from typing import Callable, Iterable
 
 import requests
 
 from .api import Pdf
+
+log = logging.getLogger(__name__)
 
 
 def slugify(text: str, max_len: int = 80) -> str:
@@ -20,17 +23,20 @@ def slugify(text: str, max_len: int = 80) -> str:
 
 
 def download_pdf(url: str, dest: Path) -> tuple[bool, str]:
-    """Download a single PDF. Returns (downloaded_new, status_message)."""
+    log.debug("📄 pdf HEAD start")
     try:
         head = requests.head(url, allow_redirects=True, timeout=20)
         remote_size = int(head.headers.get("content-length", "0"))
     except Exception as e:
+        log.warning("📄 pdf HEAD failed")
         return False, f"HEAD failed: {e}"
 
     if dest.exists() and remote_size and dest.stat().st_size == remote_size:
+        log.info("📄 pdf skipped: existing complete")
         return False, f"skip ({dest.stat().st_size // 1024} KB)"
 
     dest.parent.mkdir(parents=True, exist_ok=True)
+    log.info("📄 pdf GET start")
     with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
         tmp = dest.with_suffix(dest.suffix + ".part")
@@ -39,20 +45,21 @@ def download_pdf(url: str, dest: Path) -> tuple[bool, str]:
                 if chunk:
                     f.write(chunk)
         tmp.replace(dest)
+    log.info("📄 pdf GET done")
     return True, f"downloaded ({dest.stat().st_size // 1024} KB)"
 
 
 ProgressCb = Callable[[dict], None]
 
 
-def download_course(
+def download_course_pdfs(
     course_name: str,
     pdfs: Iterable[Pdf],
     output_root: Path,
     progress: ProgressCb | None = None,
 ) -> dict:
-    """Download every PDF for a course into `output_root/<course>/`."""
     pdfs = list(pdfs)
+    log.info("📄 pdf course start: total=%d", len(pdfs))
     out_dir = output_root / slugify(course_name)
     out_dir.mkdir(parents=True, exist_ok=True)
     total = len(pdfs)
@@ -76,6 +83,7 @@ def download_course(
                 status = "skipped"
         except Exception as e:
             failed += 1
+            log.exception("📄 pdf item failed: index=%d", i)
             msg = f"FAILED: {e}"
             status = "error"
         if progress:
@@ -83,8 +91,15 @@ def download_course(
                 "course": course_name, "index": i, "total": total,
                 "file": fname, "status": status, "message": msg,
             })
+    log.info("📄 pdf course done: downloaded=%d skipped=%d failed=%d",
+             downloaded, skipped, failed)
     return {
         "course": course_name, "output_dir": str(out_dir),
         "total": total, "downloaded": downloaded,
         "skipped": skipped, "failed": failed,
     }
+
+
+# Backward-compatible alias used by the standalone app.py — keeps the public
+# entry point name stable while the implementation tracks the Tools repo.
+download_course = download_course_pdfs
